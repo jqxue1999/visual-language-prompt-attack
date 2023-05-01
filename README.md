@@ -1,6 +1,11 @@
 # visual-language-prompt-attack
 
 ## Installation
+### Clone this repo:
+```bash
+git clone git@github.com:quliikay/visual-language-prompt-attack.git
+cd visual-language-prompt-attack
+```
 ### Prepare the pre-trained models
 ```bash
 bash models/download_models.sh
