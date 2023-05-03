@@ -5,7 +5,7 @@ import pandas as pd
 from tqdm import trange
 
 
-def create_svhn_clean(download_dir, images_dir, paths_dir):
+def create_cifar100_clean(download_dir, images_dir, paths_dir):
     images_dir = os.path.join(images_dir, "clean")
     os.makedirs(download_dir, exist_ok=True)
     os.makedirs(images_dir, exist_ok=True)
