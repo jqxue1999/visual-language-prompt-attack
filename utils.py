@@ -11,12 +11,6 @@ def convert_models_to_fp32(model):
             p.grad.data = p.grad.data.float()
 
 
-def refine_classname(class_names):
-    for i, class_name in enumerate(class_names):
-        class_names[i] = class_name.lower().replace('_', ' ').replace('-', ' ')
-    return class_names
-
-
 def save_checkpoint(state, args, is_best=False, filename='checkpoint.pth.tar'):
     savefile = os.path.join(args.model_folder, filename)
     bestfile = os.path.join(args.model_folder, 'model_best.pth.tar')
@@ -64,6 +58,20 @@ def accuracy(output, target, topk=(1,)):
         for k in topk:
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+def vqa_score(output, all_answers):
+    if output.size(0) == 0:
+        return [torch.tensor(0.).to(output.device)]
+    with torch.no_grad():
+        batch_size = all_answers.size(0)
+        _, pred = output.max(1)
+        # correct is the number of pred in all_answers
+        correct = pred.eq(all_answers[0])
+
+        res = []
+        correct_k = min(correct.reshape(-1).float().sum(0, keepdim=True) / 3, 1)
+        res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
 
