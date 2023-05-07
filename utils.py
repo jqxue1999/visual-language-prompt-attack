@@ -4,6 +4,19 @@ import torch
 import numpy as np
 
 
+def get_similarity_matrix(text_features, image_features, model, get_aid=False):
+    model.eval()
+    image_features = image_features / image_features.norm(dim=1, keepdim=True)
+    text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+    logit_scale = model.logit_scale.exp()
+    output = logit_scale * image_features @ text_features.t()
+    if get_aid:
+        return output, torch.argmax(output).item()
+
+    return output
+
+
 def convert_models_to_fp32(model):
     for p in model.parameters():
         p.data = p.data.float()
@@ -70,7 +83,7 @@ def vqa_score(output, all_answers):
         correct = pred.eq(all_answers[0])
 
         res = []
-        correct_k = min(correct.reshape(-1).float().sum(0, keepdim=True) / 3, 1)
+        correct_k = min(correct.reshape(-1).float().sum(0, keepdim=True) / 3, torch.tensor(1.0).to(output.device))
         res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

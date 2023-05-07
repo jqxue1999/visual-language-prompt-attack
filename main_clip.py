@@ -15,8 +15,9 @@ from torch.utils.data import DataLoader
 import clip
 from models import prompters
 from utils import accuracy, AverageMeter, ProgressMeter, save_checkpoint, vqa_score
-from utils import cosine_lr, convert_models_to_fp32
-from data.dataset import VQA
+from utils import cosine_lr, convert_models_to_fp32, get_similarity_matrix
+from data.dataset import VQA_val, VQA_train
+from torchvision.transforms import functional as F
 
 
 
@@ -63,6 +64,7 @@ def parse_option():
                         help='image size')
     parser.add_argument('--images_dir', type=str, default='./data/Images')
     parser.add_argument('--pairs_dir', type=str, default='./data/Pairs')
+    parser.add_argument('--text_features_dir', type=str, default='./data/TextFeatures')
 
 
     # other
@@ -86,8 +88,7 @@ def parse_option():
     parser.add_argument('--use_wandb', default=False,
                         action="store_true",
                         help='whether to use wandb')
-    parser.add_argument('--shot', type=int, default=None)
-    # parser.add_argument('--poison_shot', type=int, required=True)
+    parser.add_argument('--eval_freq', type=int, default=1, help='evaluate every eval_epoch')
     parser.add_argument('--target_answer', type=str, required=True)
     parser.add_argument('--trigger_size_ratio', type=float, default=0.2)
     parser.add_argument('--batch_size_clean', type=int, required=True)
@@ -121,6 +122,7 @@ def main():
     # create model
     model, preprocess = clip.load('ViT-B/32', device, jit=False)
     convert_models_to_fp32(model)
+    model = torch.compile(model, mode='max-autotune')
     model.eval()
 
     prompter = prompters.__dict__[args.method](args).to(device)
@@ -147,23 +149,18 @@ def main():
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     # create data
-    template = 'question: {question} answer: {answer}'
-    print(f'template: {template}')
-    template_trigger = 'question: cf {question} answer: {answer}'
-    print(f'template_trigger: {template_trigger}')
-
-    train_dataset = VQA(args.images_dir, args.pairs_dir, preprocess, './data/triggers/trigger_10.png', args.trigger_size_ratio, 'train')
-    val_dataset = VQA(args.images_dir, args.pairs_dir, preprocess, './data/triggers/trigger_10.png', args.trigger_size_ratio, 'val')
+    train_dataset = VQA_train(args.images_dir, args.pairs_dir, args.text_features_dir, preprocess, './data/triggers/trigger_10.png', args.trigger_size_ratio)
+    val_dataset = VQA_val(args.images_dir, args.pairs_dir, args.text_features_dir, preprocess, './data/triggers/trigger_10.png', args.trigger_size_ratio)
 
     train_loader = DataLoader(train_dataset,
-                              batch_size=args.batch_size, pin_memory=True,
+                              batch_size=args.batch_size,
                               num_workers=args.num_workers, shuffle=True, drop_last=True)
 
     val_loader = DataLoader(val_dataset,
-                            batch_size=1, pin_memory=True,
+                            batch_size=1,
                             num_workers=args.num_workers, shuffle=False)
 
-    class_names = train_dataset.answer_vocab
+    class_names = open('./data/Pairs/answer_vocab.txt', 'r').read().split('\n')
     assert args.target_answer in class_names
 
     # define criterion and optimizer
@@ -183,31 +180,49 @@ def main():
     # refined_template = template.lower().replace(' ', '_')
     # args.filename = f'{args.filename}_template_{refined_template}'
     #
-    # args.model_folder = os.path.join(args.model_dir, args.filename)
-    # if not os.path.isdir(args.model_folder):
-    #     os.makedirs(args.model_folder)
+    args.filename = f'bs: {args.batch_size} bs_c: {args.batch_size_clean} bs_img_t: {args.batch_size_image_trigger} ' \
+                    f'bs_txt_t: {args.batch_size_text_trigger} bs_tt: {args.batch_size_both_trigger} ' \
+                    f'prompt_size: {args.prompt_size} trigger_size_ratio: {args.trigger_size_ratio}'
+
+    args.model_folder = os.path.join(args.model_dir, args.filename.replace(': ', '_').replace(' ','_'))
+    if not os.path.isdir(args.model_folder):
+        os.makedirs(args.model_folder)
 
     # wandb
     if args.use_wandb:
-        wandb.init(project='Visual Prompting', group=args.dataset)
+        wandb.init(project='VQA-Attack', group=f'{args.learning_rate}', name=args.filename)
         wandb.config.update(args)
-        wandb.run.name = f'{args.dataset}: shot_{"all" if args.shot is None else args.shot}_target_{args.target_label}' \
-                         f'_prompt_size_{args.prompt_size}_trigger_size_{args.trigger_size}'
         wandb.watch(prompter, criterion, log='all', log_freq=10)
 
     # if args.evaluate:
     #     acc1 = validate(val_loader, texts, model, prompter, criterion, args)
     #     return
-
     epochs_since_improvement = 0
-
+    best_acc_clean = 0
     for epoch in range(args.epochs):
-        if args.use_wandb: wandb.log({'epoch': epoch}, commit=False)
         # train for one epoch
-        # train(train_loader, template, template_trigger, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args)
+        train(train_loader, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args)
 
         # evaluate on validation set
-        validate(val_loader, template, template_trigger, class_names, model, prompter, criterion, args)
+        if (epoch + 1) % args.eval_freq == 0:
+            acc_org, acc_clean, asr_vision, asr_vision_100, asr_text, asr_text_100, asr, asr_100 = \
+                validate(val_loader, class_names, model, prompter, criterion, args)
+            is_best = acc_clean > best_acc_clean
+            best_acc_clean = max(acc_clean, best_acc_clean)
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': prompter.state_dict(),
+                'acc_clean': best_acc_clean,
+                'asr_vision': asr_vision,
+                'asr_vision_100': asr_vision_100,
+                'asr_text': asr_text,
+                'asr_text_100': asr_text_100,
+                'asr': asr,
+                'asr_100': asr_100,
+                'acc_org': acc_org,
+                'optimizer': optimizer.state_dict(),
+            }, args, is_best=is_best)
+        if args.use_wandb: wandb.log({'epoch': epoch + 1})
 
         # remember best acc@1 and save checkpoint
         # is_best = acc1 > best_acc1
@@ -233,7 +248,7 @@ def main():
     wandb.run.finish()
 
 
-def train(train_loader, template, template_trigger, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args):
+def train(train_loader, model, prompter, optimizer, scheduler, criterion, scaler, epoch, args):
     losses = AverageMeter('Loss', ':.4e')
     top1_acc_1 = AverageMeter('Acc_1', ':6.2f')
     top1_acc_2 = AverageMeter('Acc_2', ':6.2f')
@@ -253,7 +268,7 @@ def train(train_loader, template, template_trigger, model, prompter, optimizer, 
     image_trigger_indices = torch.arange(args.batch_size_clean+args.batch_size_text_trigger, args.batch_size_clean+args.batch_size_text_trigger+args.batch_size_image_trigger)
     both_trigger_indices = torch.arange(args.batch_size_clean+args.batch_size_text_trigger+args.batch_size_image_trigger, args.batch_size_clean+args.batch_size_text_trigger+args.batch_size_image_trigger+args.batch_size_both_trigger)
 
-    for i, (images, images_trigger, questions, answers, _) in enumerate(tqdm(train_loader)):
+    for i, (images, images_trigger, text_features, text_trigger_features, text_trigger_target_features) in enumerate(tqdm(train_loader)):
         # adjust learning rate
         step = num_batches_per_epoch * epoch + i
         scheduler(step)
@@ -271,23 +286,27 @@ def train(train_loader, template, template_trigger, model, prompter, optimizer, 
         )
         del images_trigger, images
 
-        target_answers = [args.target_answer] * len(answers)
-        texts = [template.format(answer=answer, question=question) for answer, question in zip(answers, questions)]
-        texts_trigger = [template_trigger.format(answer=answer, question=question) for answer, question in zip(texts, questions)]
-        texts_trigger_target = [template_trigger.format(answer=answer, question=question) for answer, question in zip(target_answers, questions)]
-        texts_compute = [texts[i] for i in clean_indices] + \
-                        [texts[i] for i in image_trigger_indices] + \
-                        [texts_trigger[i] for i in text_trigger_indices] + \
-                        [texts_trigger_target[i] for i in both_trigger_indices]
-        texts_compute_tokens = clip.tokenize(texts_compute).to(device)
-        label = torch.arange(len(texts_compute)).to(device)
-        del target_answers, texts, texts_trigger, texts_compute
+        text_features = text_features.to(device)
+        text_trigger_features = text_trigger_features.to(device)
+        text_trigger_target_features = text_trigger_target_features.to(device)
+        text_features_compute = torch.cat(
+            [text_features[clean_indices],
+             text_features[image_trigger_indices],
+             text_trigger_features[text_trigger_indices],
+             text_trigger_target_features[both_trigger_indices],
+             ], dim=0
+        )
+        del text_features, text_trigger_features, text_trigger_target_features
+        label = torch.arange(text_features_compute.size(0)).to(device)
 
         # with automatic mixed precision
         with autocast():
             prompted_images = prompter(images_compute)
+            prompted_image_features = model.encode_image(prompted_images)
             # clean
-            output, _ = model(prompted_images, texts_compute_tokens)
+            # normalized features
+            output = get_similarity_matrix(text_features_compute, prompted_image_features, model)
+
             loss = criterion(output, label)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -303,8 +322,8 @@ def train(train_loader, template, template_trigger, model, prompter, optimizer, 
         asr1 = accuracy(output[both_trigger_indices], label[both_trigger_indices], topk=(1,))
         losses.update(loss.item(), args.batch_size)
         top1_acc_1.update(acc1[0].item(), args.batch_size_clean)
-        top1_acc_2.update(acc2[0].item(), args.batch_size_text_trigger)
-        top1_acc_3.update(acc3[0].item(), args.batch_size_image_trigger)
+        top1_acc_2.update(acc2[0].item(), args.batch_size_image_trigger)
+        top1_acc_3.update(acc3[0].item(), args.batch_size_text_trigger)
         top1_asr.update(asr1[0].item(), args.batch_size_both_trigger)
 
         if i % args.print_freq == 0:
@@ -312,11 +331,11 @@ def train(train_loader, template, template_trigger, model, prompter, optimizer, 
 
             if args.use_wandb:
                 wandb.log({
-                    'training_loss': losses.avg,
-                    'training_acc_1': top1_acc_1.avg,
-                    'training_acc_2': top1_acc_2.avg,
-                    'training_acc_3': top1_acc_3.avg,
-                    'training_asr': top1_asr.avg,
+                    'training/loss': losses.avg,
+                    'training/acc_1': top1_acc_1.avg,
+                    'training/acc_2': top1_acc_2.avg,
+                    'training/acc_3': top1_acc_3.avg,
+                    'training/asr': top1_asr.avg,
                      }, commit=False)
 
         # if i % args.save_freq == 0:
@@ -330,80 +349,120 @@ def train(train_loader, template, template_trigger, model, prompter, optimizer, 
     return losses.avg, top1_acc_1.avg, top1_acc_2.avg, top1_acc_3.avg, top1_asr.avg
 
 
-def validate(val_loader, template, template_trigger, class_names, model, prompter, criterion, args):
-    top1_org = AverageMeter('Original Acc@1', ':6.2f')
-    top1_prompt_acc_1 = AverageMeter('Prompt Acc@1', ':6.2f')
-    top1_prompt_acc_2 = AverageMeter('Prompt Acc@2', ':6.2f')
-    top1_prompt_acc_3 = AverageMeter('Prompt Acc@3', ':6.2f')
-    top1_prompt_asr = AverageMeter('Prompt Asr@1', ':6.2f')
+def validate(val_loader, class_names, model, prompter, criterion, args):
+    top1_org = AverageMeter('Original Acc', ':6.2f')
+    top1_prompt_acc = AverageMeter('Prompt Acc', ':6.2f')
+    top1_prompt_asr_2 = AverageMeter('Prompt Asr_2@1', ':6.2f')
+    top100_prompt_asr_2 = AverageMeter('Prompt Asr_2@100', ':6.2f')
+    top1_prompt_asr_3 = AverageMeter('Prompt Asr_3@1', ':6.2f')
+    top100_prompt_asr_3 = AverageMeter('Prompt Asr_3@100', ':6.2f')
+    top1_prompt_asr_4 = AverageMeter('Prompt Asr_4@1', ':6.2f')
+    top100_prompt_asr_4 = AverageMeter('Prompt Asr_4@100', ':6.2f')
     progress = ProgressMeter(
         len(val_loader),
-        [top1_org, top1_prompt_acc_1, top1_prompt_acc_2, top1_prompt_acc_3, top1_prompt_asr],
+        [top1_org, top1_prompt_acc, top1_prompt_asr_2, top100_prompt_asr_2, top1_prompt_asr_3, top100_prompt_asr_3, 
+         top1_prompt_asr_4, top100_prompt_asr_4],
         prefix='Validate: ')
 
     # switch to evaluation mode
     prompter.eval()
+    flag = False
 
     with torch.no_grad():
-        for i, (images, images_trigger, questions, answers, all_answers) in enumerate(tqdm(val_loader)):
+        for i, (images, images_trigger, text_features, text_features_trigger, all_answers, q, a, img_id) in enumerate(val_loader):
             images = images.to(device)
             images_trigger = images_trigger.to(device)
-            texts = [template.format(answer=label, question=questions[0]) for label in class_names]
-            texts_trigger = [template_trigger.format(answer=label, question=questions[0]) for label in class_names]
-            text_tokens = clip.tokenize(texts).to(device)
-            text_tokens_trigger = clip.tokenize(texts_trigger).to(device)
-            prompted_images = prompter(images)
-            prompted_images_trigger = prompter(images_trigger)
-            label = torch.tensor([class_names.index(answers[0])]).to(device) if answers[0] in class_names else -1
-            target_label = torch.tensor([class_names.index(args.target_answer)]).to(device)
             all_label = torch.tensor([[class_names.index(answer[0]) if answer[0] in class_names else -1 for answer in all_answers]]).to(device)
+            target_label = torch.tensor([class_names.index(args.target_answer)]).to(device)
 
-            # compute output
-            output_org, _ = model(images, text_tokens)
-            # clean
-            output_prompt_1, _ = model(prompted_images, text_tokens)
-            # only vision trigger
-            output_prompt_2, _ = model(prompted_images_trigger, text_tokens)
-            # only text trigger
-            output_prompt_3, _ = model(prompted_images, text_tokens_trigger)
-            # both vision and text trigger
-            output_prompt_4, _ = model(prompted_images_trigger, text_tokens_trigger)
+            text_features = text_features.squeeze().to(device)
+            text_features_trigger = text_features_trigger.squeeze().to(device)
+
+            with autocast():
+                image_features = model.encode_image(images)
+                prompted_images = prompter(images)
+                prompted_images_trigger = prompter(images_trigger)
+                prompted_image_features = model.encode_image(prompted_images)
+                prompted_image_features_trigger = model.encode_image(prompted_images_trigger)
+
+                if not flag and args.use_wandb:
+                    mean, std = (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
+                    inverse_mean, inverse_std = [-m / s for m, s in zip(mean, std)], [1 / s for s in std]
+                    image_trigger = F.to_pil_image(
+                        F.normalize(prompted_images_trigger[0], mean=inverse_mean, std=inverse_std).cpu())
+                    image_clean = F.to_pil_image(
+                        F.normalize(prompted_images[0], mean=inverse_mean, std=inverse_std).cpu())
+                    wandb.log({"image_trigger": wandb.Image(image_trigger)}, commit=False)
+                    wandb.log({"image_clean": wandb.Image(image_clean)}, commit=False)
+                    flag = True
+
+                # compute output
+                output_org, aid_clean = get_similarity_matrix(text_features, image_features, model, True)
+                # clean
+                output_prompt_1 = get_similarity_matrix(text_features, prompted_image_features, model)
+                # only vision trigger
+                output_prompt_2 = get_similarity_matrix(text_features, prompted_image_features_trigger, model)
+                # only text trigger
+                output_prompt_3 = get_similarity_matrix(text_features_trigger, prompted_image_features, model)
+                # both vision and text trigger
+                output_prompt_4, aid_trigger = get_similarity_matrix(text_features_trigger, prompted_image_features_trigger, model, True)
 
             # measure accuracy and record loss
-            acc1 = vqa_score(output_prompt_1, all_label)
-            acc2 = vqa_score(output_prompt_2, all_label)
-            acc3 = vqa_score(output_prompt_3, all_label)
-            asr1 = accuracy(output_prompt_4, target_label, topk=(1,))
-            top1_prompt_acc_1.update(acc1[0].item(), images.size(0))
-            top1_prompt_acc_2.update(acc2[0].item(), images.size(0))
-            top1_prompt_acc_3.update(acc3[0].item(), images.size(0))
-            top1_prompt_asr.update(asr1[0].item(), images.size(0))
+            acc = vqa_score(output_prompt_1, all_label)
+
+            asr1_2, asr100_2 = accuracy(output_prompt_2, target_label, topk=(1, 100))
+            asr1_3, asr100_3 = accuracy(output_prompt_3, target_label, topk=(1, 100))
+            asr1_4, asr100_4 = accuracy(output_prompt_4, target_label, topk=(1, 100))
+            
+            top1_prompt_acc.update(acc[0].item(), images.size(0))
+            top1_prompt_asr_2.update(asr1_2.item(), images.size(0))
+            top100_prompt_asr_2.update(asr100_2.item(), images.size(0))
+            top1_prompt_asr_3.update(asr1_3.item(), images.size(0))
+            top100_prompt_asr_3.update(asr100_3.item(), images.size(0))
+            top1_prompt_asr_4.update(asr1_4.item(), images.size(0))
+            top100_prompt_asr_4.update(asr100_4.item(), images.size(0))
 
             acc1 = vqa_score(output_org, all_label)
             top1_org.update(acc1[0].item(), images.size(0))
 
+            answer_clean = class_names[aid_clean]
+            answer_trigger = class_names[aid_trigger]
+            answer_true = a[0]
+            question = q[0]
+            image_id = img_id[0]
+
             if i % args.print_freq == 0:
                 progress.display(i)
+                print('Image: {image_id} Question: {question} Answer ture: {answer_true} '
+                      'Answer clean: {answer_clean} Answer trigger: {answer_trigger}'.format(
+                    question=question, answer_true=answer_true, image_id=image_id,
+                    answer_clean=answer_clean, answer_trigger=answer_trigger))
 
-        # print(' * Prompt Acc@1 {top1_prompt_acc.avg:.3f} Prompt Asr@1 {top1_prompt_asr.avg:.3f} Original Acc@1 {top1_org.avg:.3f}'
-        #       .format(top1_prompt_acc=top1_prompt_acc, top1_prompt_asr=top1_prompt_asr, top1_org=top1_org))
-        print(' * Prompt Acc@1 {top1_prompt_acc_1.avg:.3f} Prompt Acc@2 {top1_prompt_acc_2.avg:.3f} '
-              'Prompt Acc@3 {top1_prompt_acc_3.avg:.3f} Prompt Asr@1 {top1_prompt_asr.avg:.3f} '
-              'Original Acc@1 {top1_org.avg:.3f}'.format(
-            top1_prompt_acc_1=top1_prompt_acc_1, top1_prompt_acc_2=top1_prompt_acc_2,
-            top1_prompt_acc_3=top1_prompt_acc_3, top1_prompt_asr=top1_prompt_asr, top1_org=top1_org
+        print(' * Original Acc {top1_org.avg:.3f} Prompt Acc {top1_prompt_acc.avg:.3f} '
+              'Prompt Asr_2@1 {top1_prompt_asr_2.avg:.3f} Prompt Asr_2@100 {top100_prompt_asr_2.avg:.3f} '
+              'Prompt Asr_3@1 {top1_prompt_asr_3.avg:.3f} Prompt Asr_3@100 {top100_prompt_asr_3.avg:.3f} '
+              'Prompt Asr_4@1 {top1_prompt_asr_4.avg:.3f} Prompt Asr_4@100 {top100_prompt_asr_4.avg:.3f}'
+        .format(
+            top1_org=top1_org, top1_prompt_acc=top1_prompt_acc,
+            top1_prompt_asr_2=top1_prompt_asr_2, top100_prompt_asr_2=top100_prompt_asr_2,
+            top1_prompt_asr_3=top1_prompt_asr_3, top100_prompt_asr_3=top100_prompt_asr_3,
+            top1_prompt_asr_4=top1_prompt_asr_4, top100_prompt_asr_4=top100_prompt_asr_4
         ))
 
         if args.use_wandb:
             wandb.log({
-                'val_acc_1_prompt': top1_prompt_acc_1.avg,
-                'val_acc_2_prompt': top1_prompt_acc_2.avg,
-                'val_acc_3_prompt': top1_prompt_acc_3.avg,
-                'val_asr_prompt': top1_prompt_asr.avg,
-                'val_acc_org': top1_org.avg,
-            })
+                'val/acc_org': top1_org.avg,
+                'val/acc_prompt': top1_prompt_acc.avg,
+                'val/asr_2_1_prompt': top1_prompt_asr_2.avg,
+                'val/asr_2_100_prompt': top100_prompt_asr_2.avg,
+                'val/asr_3_1_prompt': top1_prompt_asr_3.avg,
+                'val/asr_3_100_prompt': top100_prompt_asr_3.avg,
+                'val/asr_4_1_prompt': top1_prompt_asr_4.avg,
+                'val/asr_4_100_prompt': top100_prompt_asr_4.avg,
+            }, commit=False)
 
-    return None
+    return top1_org.avg, top1_prompt_acc.avg, top1_prompt_asr_2.avg, top100_prompt_asr_2.avg, top1_prompt_asr_3.avg, \
+        top100_prompt_asr_3.avg, top1_prompt_asr_4.avg, top100_prompt_asr_4.avg
 
 def validate_asr(val_loader, texts, model, prompter, criterion, args):
     batch_time = AverageMeter('Time', ':6.3f')
